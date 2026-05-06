@@ -42,6 +42,7 @@
 ---
 
 ## 🚀 快速开始 (Quick Start)
+### 0. 请在运行代码前，先解压 data.zip 文件 (Please extract data.zip before running).
 
 ### 1. 环境依赖 (Dependencies)
 请确保您的 R 环境安装了以下核心依赖包：
