@@ -1,0 +1,618 @@
+---
+title: "GC-Microbiome-Biomarkers"
+author: "Liang zhiwei"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r,message=FALSE}
+# =========================================================================
+# Setup & Initialization
+# =========================================================================
+update_info <- file.info("./data/MWAS_stool_species_res.tsv")
+path <- "./output/"
+dir.create(path,recursive = TRUE,showWarnings = FALSE)
+
+library(data.table)
+library(dplyr)
+library(readxl)
+```
+
+#Data Import
+```{r data_import, message=FALSE}
+
+# =========================================================================
+# Read and format abundance data, filter with MWAS results
+# =========================================================================
+selected_fdr_wilcox <- fread("./data/MWAS_stool_species_res.tsv") %>%
+  filter(as.numeric(P_wilcoxon_V)<0.05 | as.numeric(P_maaslin_V)<0.05) 
+
+rownames(selected_fdr_wilcox) <- selected_fdr_wilcox$Taxon
+
+dt_rj <- fread("./data/Cohort1_stool_dt.tsv") 
+dt_hrb <- fread("./data/Cohort2_stool_dt.tsv")
+
+dt_rj <- dt_rj[Taxon %in% dt_hrb$Taxon] ## Taxon overlap
+dt_hrb <- dt_hrb[Taxon %in% dt_rj$Taxon] 
+
+task_stool_rj  <- dcast(dt_rj, ID+group~Taxon, value.var = "clr_abundance") %>%
+  mutate(group = factor(group,levels = c("cancer","gastritis"),labels = c("cancer" = 1 , "gastritis" = 0)))  %>%
+  select(ID,group,any_of(rownames(selected_fdr_wilcox))) #mute when all
+
+task_rj <-task_stool_rj %>% select(-ID) #build model (repeated use)
+
+
+task_stool_hrb  <- dcast(dt_hrb, ID+group~Taxon, value.var = "clr_abundance") %>%
+  mutate(group = factor(group,levels = c("cancer","gastritis"),labels = c("cancer" = 1 , "gastritis" = 0))) %>%
+  select(ID,group,any_of(rownames(selected_fdr_wilcox))) #mute when all
+
+task_hrb <- task_stool_hrb %>% select(-ID) #test model (use only once)
+```
+
+#Feature Selection (Boruta)
+```{r boruta_selection}
+# =========================================================================
+# Ultra-strict feature selection to prevent overfitting
+# =========================================================================
+library(Boruta)
+ X  <- task_rj[, -1]   
+ y  <- task_rj$group
+
+set.seed(11)   #  reproducible
+boruta <- Boruta(
+  x = X,
+  y = y,
+  maxRuns = 200,
+  pValue = 0.001,
+  mcAdj = TRUE,
+  doTrace      = 2,     
+  holdHistory  = TRUE,  
+  getImp       = getImpRfZ  
+)
+
+```
+
+#Decision Plot
+```{r boruta_plot}
+# =========================================================================
+# Visualize Confirmed Biomarkers
+# =========================================================================
+library(tibble)
+library(ggplot2)
+library(ggtext)
+library(stringr)
+library(ggpp)
+
+imp_df <- attStats(boruta) %>% 
+  rownames_to_column(.,var = "feature") %>% 
+  mutate(
+  decision = factor(decision, c("Confirmed","Tentative","Rejected")),
+  feature  = reorder(feature, medianImp),  
+  rank     = dense_rank(desc(medianImp))  
+)
+
+write.csv(imp_df,paste(path,"boruta_imp_stool.csv",sep = ""))
+
+
+# Filter only Confirmed features for plotting
+imp_df_confirmed <- attStats(boruta) %>% 
+  rownames_to_column(.,var = "feature") %>% 
+  mutate(
+  decision = factor(decision, c("Confirmed","Tentative","Rejected")),
+  feature  = reorder(feature, medianImp),  
+  rank     = dense_rank(desc(medianImp))  
+) %>%
+  filter(decision == "Confirmed")
+
+p1 <- ggplot(imp_df_confirmed, aes(feature, medianImp, fill = decision)) +
+  geom_col(width = 0.6, linewidth = 0.15) +
+  scale_fill_manual(values = c("#a3743b","#dbc395","#75706b")) + #c("#4DAF4A", "#FF7F00","#E41A1C")) +
+  geom_text(aes(label = sprintf("%.2f", medianImp)),
+            hjust = -0.1, size = 3, color = "black") +
+  coord_flip() +
+  labs(#title = "Boruta Feature Screening",
+       #subtitle = "Only include <b style='color:#4DAF4A'>Confirmed</b> variables in the model.",
+       x = NULL, y = "Median Importance") +
+  scale_y_continuous(limits = c(0,25))+
+  theme(
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = ggtext::element_markdown(),
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10,face = "italic"),
+    panel.background = element_blank(),  
+    panel.border     = element_rect(colour = "black", fill = NA),
+    base_size = 14, base_family = "sans"
+  )
+p1
+ggsave(paste(path,"boruta_feature_selection_bar.pdf",sep = ""),plot = p1,width = 6,height = 6,dpi = 300)
+
+```
+
+#Model Building & Benchmarking
+```{r model_benchmarking}
+# =========================================================================
+# Train 6 Machine Learning algorithms with 10-fold CV and compare AUC
+# =========================================================================
+boruta_decision <- data.frame(boruta$finalDecision) %>% filter(boruta.finalDecision == "Confirmed")
+
+task_hrb <- task_stool_hrb %>% select(group,rownames(boruta_decision))
+task_rj <- task_stool_rj %>% select(group,rownames(boruta_decision))
+
+
+
+library(pROC)
+library(caret)
+set.seed(11)
+
+task_rj$group <- factor(task_rj$group,
+                        levels = c("0","1"),
+                        labels = c("ChG","GC"))
+task_hrb$group <- factor(task_hrb$group,
+                        levels = c("0","1"),
+                        labels = c("ChG","GC"))
+
+train_control <- trainControl(
+  method = "cv",            
+  number = 10,
+  classProbs = TRUE,        
+  summaryFunction = twoClassSummary,
+  savePredictions = "final" 
+)
+
+# --- Train GLM ---
+glm <- train(
+  group ~ .,
+  data = task_rj,
+  method = "glm",          
+  family = binomial,
+  trControl = train_control,
+  metric = "ROC"
+)
+
+cv_roc_dat <- glm$pred %>% 
+     distinct(rowIndex, .keep_all = TRUE) %>% 
+     arrange(rowIndex)
+roc_glm <- roc(response = cv_roc_dat$obs,
+                predictor  = cv_roc_dat[, "GC"],
+               ci=TRUE) 
+
+hrb_predictions <- predict(glm, newdata = task_hrb, type = "prob") [,"GC"]
+glm_hrb <- roc(group ~ hrb_predictions,data = task_hrb,direction = roc_glm$direction,levels = roc_glm$levels,ci=TRUE) 
+
+
+
+# --- Train LDA ---
+lda <- train(
+  group ~ .,
+  data = task_rj,
+  method = "lda",           
+  family = binomial,
+  trControl = train_control,
+  metric = "ROC"           
+)
+
+cv_roc_dat <- lda$pred %>% 
+     distinct(rowIndex, .keep_all = TRUE) %>% 
+     arrange(rowIndex)
+roc_lda <- roc(response = cv_roc_dat$obs,
+                predictor  = cv_roc_dat[, "GC"],
+               ci=TRUE) 
+
+hrb_predictions <- predict(lda, newdata = task_hrb, type = "prob") [,"GC"]
+lda_hrb <- roc(group ~ hrb_predictions,data = task_hrb,direction = roc_lda$direction,levels = roc_lda$levels,ci=TRUE)
+
+# --- Train Random Forest (RF) ---
+rf <- train(
+  group ~ .,
+  data = task_rj,
+  method = "rf",           
+  family = binomial,
+  trControl = train_control,
+  metric = "ROC"            
+)
+
+cv_roc_dat <- rf$pred %>% 
+     distinct(rowIndex, .keep_all = TRUE) %>% 
+     arrange(rowIndex)
+roc_rf <- roc(response = cv_roc_dat$obs,
+                predictor  = cv_roc_dat[, "GC"],
+               ci=TRUE) 
+
+
+hrb_predictions <- predict(rf, newdata = task_hrb, type = "prob") [,"GC"]
+rf_hrb_predictions <- hrb_predictions
+rf_hrb <- roc(group ~ hrb_predictions,data = task_hrb,direction = roc_rf$direction,levels = roc_rf$levels,ci=TRUE)
+
+
+# --- Train SVM (Linear) ---
+svm <- train(
+  group ~ .,
+  data = task_rj,
+  method = "svmLinear",           
+  family = binomial,
+  trControl = train_control,
+  metric = "ROC"          
+)
+
+cv_roc_dat <- svm$pred %>% 
+     distinct(rowIndex, .keep_all = TRUE) %>% 
+     arrange(rowIndex)
+roc_svm <- roc(response = cv_roc_dat$obs,
+                predictor  = cv_roc_dat[, "GC"],
+               ci=TRUE) 
+
+hrb_predictions <- predict(svm, newdata = task_hrb, type = "prob") [,"GC"]
+svm_hrb <- roc(group ~ hrb_predictions,data = task_hrb,direction = roc_svm$direction,levels = roc_svm$levels,ci=TRUE)
+
+
+# --- Train Neural Network (NNet) ---
+nnet <- train(
+  group ~ .,
+  data = task_rj,
+  method = "nnet",           
+  family = binomial,
+  trControl = train_control,
+  metric = "ROC"            
+)
+
+cv_roc_dat <- nnet$pred %>% 
+     distinct(rowIndex, .keep_all = TRUE) %>% 
+     arrange(rowIndex)
+roc_nnet <- roc(response = cv_roc_dat$obs,
+                predictor  = cv_roc_dat[, "GC"],
+               ci=TRUE) 
+ 
+
+hrb_predictions <- predict(nnet, newdata = task_hrb, type = "prob") [,"GC"]
+nnet_hrb <- roc(group ~ hrb_predictions,data = task_hrb,direction = roc_nnet$direction,levels = roc_nnet$levels,ci=TRUE)
+
+# --- Train K-Nearest Neighbors (KKNN) ---
+kknn <- train(
+  group ~ .,
+  data = task_rj,
+  method = "kknn",           
+  family = binomial,
+  trControl = train_control,
+  metric = "ROC"           
+)
+
+cv_roc_dat <- kknn$pred %>% 
+     distinct(rowIndex, .keep_all = TRUE) %>% 
+     arrange(rowIndex)
+roc_kknn <- roc(response = cv_roc_dat$obs,
+                predictor  = cv_roc_dat[, "GC"],
+               ci=TRUE) 
+
+
+hrb_predictions <- predict(kknn, newdata = task_hrb, type = "prob") [,"GC"]
+kknn_hrb <- roc(group ~ hrb_predictions,data = task_hrb,direction = roc_kknn$direction,levels = roc_kknn$levels,ci=TRUE)
+
+```
+
+
+#Generate Multi-Model ROC Curves
+```{r roc_curves}
+# =========================================================================
+# Plot Training & Validation ROC Curves
+# =========================================================================
+pdf(paste0(path, "rj_meta.pdf"), width = 6, height = 6)
+plot.roc(roc_svm,
+         col ="#b4446c",
+         lwd = 4,
+         cex.axis = 1.7,
+         cex.lab = 1.7,
+         cex.main = 1.7,
+         print.thres.col ="#b4446c",
+         identity.col ="black",
+         identity.lty =2,
+         identity.lwd =2,
+         xlim = c(1, 0),  
+         ylim = c(0, 1))
+lines.roc(roc_rf,
+          lwd = 4,
+          col =rgb(49,45,80, max = 255, alpha = 100))
+lines.roc(roc_lda,
+          lwd = 4,
+          col =rgb(92,122,218, max = 255, alpha = 100))
+lines.roc(roc_glm,
+          lwd = 4,
+          col =rgb(99,88,157, max = 255, alpha = 100))
+lines.roc(roc_nnet,
+          lwd = 4,
+          col =rgb(134,84,122, max = 255, alpha = 100))
+lines.roc(roc_kknn,
+          lwd = 4,
+          col =rgb(134,122,0, max = 255, alpha =255))
+
+
+legend("bottomright",
+       legend = c(paste("SVM-LIN",round(roc_svm$auc,2),"(",round(roc_svm$ci[1],2),"~",round(roc_svm$ci[3],2),")")
+                  ,paste("RF",round(roc_rf$auc,2),"(",round(roc_rf$ci[1],2),"~",round(roc_rf$ci[3],2),")")
+                  ,paste("LDA",round(roc_lda$auc,2),"(",round(roc_lda$ci[1],2),"~",round(roc_lda$ci[3],2),")")
+                  ,paste("GLM",round(roc_glm$auc,2),"(",round(roc_glm$ci[1],2),"~",round(roc_glm$ci[3],2),")")
+                  ,paste("NNet",round(roc_nnet$auc,2),"(",round(roc_nnet$ci[1],2),"~",round(roc_nnet$ci[3],2),")")
+                  ,paste("WKNN",round(roc_kknn$auc,2),"(",round(roc_kknn$ci[1],2),"~",round(roc_kknn$ci[3],2),")")
+       ),
+       col=c("#b4446c",
+             rgb(49,45,80, max = 255, alpha = 100),
+             rgb(92,122,218, max = 255, alpha = 100),
+             rgb(99,88,157, max = 255, alpha = 100),
+             rgb(134,84,122, max = 255, alpha = 100)
+             ,rgb(134,122,0, max = 255, alpha = 255)
+       ),
+       lwd = 4,cex = 0.8)
+dev.off()
+
+# Validation Set (HRB)
+pdf(paste0(path, "hrb_meta.pdf"), width = 6, height = 6)
+plot.roc(svm_hrb,
+         col ="#b4446c",
+         lwd = 4,
+         cex.axis = 1.7,
+         cex.lab = 1.7,
+         cex.main = 1.7,
+         print.thres.col ="#b4446c",
+         identity.col ="black",
+         identity.lty =2,
+         identity.lwd =2,
+         xlim = c(1, 0),  
+         ylim = c(0, 1))
+lines.roc(rf_hrb,
+          lwd = 4,
+          col =rgb(49,45,80, max = 255, alpha = 100))
+lines.roc(lda_hrb,
+          lwd = 4,
+          col =rgb(92,122,218, max = 255, alpha = 100))
+lines.roc(glm_hrb,
+          lwd = 4,
+          col =rgb(99,88,157, max = 255, alpha =100))
+lines.roc(nnet_hrb,
+          lwd = 4,
+          col =rgb(134,84,122, max = 255, alpha = 100))
+lines.roc(kknn_hrb,
+          lwd = 4,
+          col =rgb(134,122,0, max = 255, alpha = 255))
+
+
+legend("bottomright",
+       legend = c(paste("SVM-LIN",round(svm_hrb$auc,2),"(",round(svm_hrb$ci[1],2),"~",round(svm_hrb$ci[3],2),")")
+                  ,paste("RF",round(rf_hrb$auc,2),"(",round(rf_hrb$ci[1],2),"~",round(rf_hrb$ci[3],2),")")
+                  ,paste("LDA",round(lda_hrb$auc,2),"(",round(lda_hrb$ci[1],2),"~",round(lda_hrb$ci[3],2),")")
+                  ,paste("GLM",round(glm_hrb$auc,2),"(",round(glm_hrb$ci[1],2),"~",round(glm_hrb$ci[3],2),")")
+                  ,paste("NNet",round(nnet_hrb$auc,2),"(",round(nnet_hrb$ci[1],2),"~",round(nnet_hrb$ci[3],2),")")
+                  ,paste("WKNN",round(kknn_hrb$auc,2),"(",round(kknn_hrb$ci[1],2),"~",round(kknn_hrb$ci[3],2),")")
+       ),
+       col=c("#b4446c",
+             rgb(49,45,80, max = 255, alpha = 100),
+             rgb(92,122,218, max = 255, alpha = 100),
+             rgb(99,88,157, max = 255, alpha = 100),
+             rgb(134,84,122, max = 255, alpha = 100)
+             ,rgb(134,122,0, max = 255, alpha = 255)
+       ),
+       lwd = 4,cex = 0.8)
+dev.off()
+
+# Best Model (RF) specific ROC on HRB
+pdf(paste0(path, "hrb_rf.pdf"), width = 6, height = 6)
+plot.roc(rf_hrb,
+         print.thres = TRUE,
+         print.thres.pattern = " %.2f (%.2f-%.2f)",
+         #main ="hrbset validation (meta)",
+         col ="#a3743b",
+         lwd = 4,
+         cex.axis = 1.7,
+         cex.lab = 1.7,
+         cex.main = 1.7,
+         print.thres.col ="#a3743b",
+         identity.col ="black",
+         identity.lty =2,
+         identity.lwd =2,
+         xlim = c(1, 0),  
+         ylim = c(0, 1),
+         auc.polygon = TRUE,auc.polygon.col = "#f7efe9"
+         ,print.auc = TRUE,print.auc.x = 0.5,print.auc.y = 0.2,print.auc.col = "black",print.auc.pattern = "AUC = %.2f (%.2f-%.2f)"
+         )
+
+dev.off()
+
+# DeLong Tests (Compare RF vs others)
+rs <- roc.test(rf_hrb,svm_hrb)
+rl <- roc.test(rf_hrb,lda_hrb)
+rgl <- roc.test(rf_hrb,glm_hrb)
+rn <- roc.test(rf_hrb,nnet_hrb)
+rgb <- roc.test(rf_hrb,kknn_hrb)
+
+testResult <- data.frame(method = as.character(),
+                         datasets = as.character(),
+                         pValue = as.numeric(),
+                         ci1 = as.numeric(),
+                         ci2 = as.numeric()
+                         )
+testResult[1,] <-  c(rs$method,rs$data.names,rs$p.value,rs$conf.int[1],rs$conf.int[2])
+testResult[2,] <-  c(rl$method,rl$data.names,rl$p.value,rl$conf.int[1],rl$conf.int[2])
+testResult[3,] <-  c(rgl$method,rgl$data.names,rgl$p.value,rgl$conf.int[1],rgl$conf.int[2])
+testResult[4,] <-  c(rn$method,rn$data.names,rn$p.value,rn$conf.int[1],rn$conf.int[2])
+testResult[5,] <-  c(rgb$method,rgb$data.names,rgb$p.value,ifelse(is.null(rgb$conf.int[1]),"na",rgb$conf.int[1]),ifelse(is.null(rgb$conf.int[2]),"na",rgb$conf.int[2]))
+write.csv(testResult,paste(path,"roc_testResult.csv",sep = ""))
+```
+
+
+#Confusion Matrix
+```{r confusion_matrix}
+# =========================================================================
+# Determine optimal threshold (Youden) & Plot Confusion Matrix
+# =========================================================================
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(gridExtra)   
+library(scales)      
+
+best.thr <- coords(rf_hrb, "best", method = "youden")[1,1]
+
+pred.class <- ifelse(rf_hrb_predictions > best.thr,
+                     levels(task_hrb$group)[2],   
+                     levels(task_hrb$group)[1])   
+pred.class <- factor(pred.class, levels = levels(task_hrb$group))
+
+cm <- confusionMatrix(pred.class, task_hrb$group, mode = "everything",positive = "GC")
+cm
+
+
+plot_cm_gc_chg <- function(cm, family="sans", outfile = "cm_GC_ChG.pdf"){
+  cTab <- as.data.frame(as.table(cm$table))
+  cTab$Reference  <- factor(cTab$Reference,  levels = c("ChG","GC"), labels = c("ChG","GC"))
+  cTab$Prediction <- factor(cTab$Prediction, levels = c("ChG","GC"), labels = c("ChG","GC"))
+  p <- ggplot(cTab, aes(Prediction, Reference, fill = Freq)) +
+       geom_tile(color = "black", linewidth = 0.25) +
+       geom_text(aes(label = Freq), size = 8, color = "black") +
+       scale_fill_gradient(low = "white", high = "#a3743b") +
+       labs(x = "Predicted", y = "Observed") +
+       theme_minimal(base_size = 16, base_family = family) +
+       theme(panel.grid = element_blank(), legend.position = "none") +
+       labs(title = paste0("Sen. = ", round(cm$byClass["Sensitivity"],2), " Spe. = ", round(cm$byClass["Specificity"],2)," \nAccuracy = ",cm$overall["Accuracy"]," (",round(cm$overall["AccuracyLower"],2)," - ",round(cm$overall["AccuracyUpper"],2),")"))
+  ggsave(outfile, p, width = 5, height = 5, dpi = 300)
+  return(p)
+}
+
+
+p3<-plot_cm_gc_chg(cm, 
+               outfile=paste(path,"cm_RF.pdf",sep = ""))
+```
+
+#External Validation (Harbin Dataset)（ps,The above rj represents the stool sample sets of cohort 1; hrb represents the stool sample sets of cohort 2.）
+```{r external_validation}
+# =========================================================================
+# Independent testing on a secondary dataset
+# =========================================================================
+#Data input
+table_validation <- fread("./data/Harbin_stool_19GC_27ChG.tsv")
+
+#Data process
+task_validation2 <- dcast(table_validation,sampleID+group~taxon,value.var = "clr_abundance") %>%
+  mutate(group = factor(group,levels = c("ChG","GC"))) %>%
+  select(group,rownames(boruta_decision))
+
+#Model predict
+v2_predictions <- predict(rf,newdata = task_validation2,type = "prob")[,"GC"]
+rf_v2 <- roc(group ~ v2_predictions,data = task_validation2,direction = roc_rf$direction,levels = roc_rf$levels,ci=TRUE)
+
+# ROC Curve for External Validation
+pdf(paste0(path, "hrb2_rf.pdf"), width = 6, height = 6)
+plot.roc(rf_v2,
+         print.thres = TRUE,
+         print.thres.pattern = " %.2f (%.2f-%.2f)",
+         #main ="hrbset validation (meta)",
+         col ="#7f5a2e",
+         lwd = 4,
+         cex.axis = 1.7,
+         cex.lab = 1.7,
+         cex.main = 1.7,
+         print.thres.col ="#7f5a2e",
+         identity.col ="black",
+         identity.lty =2,
+         identity.lwd =2,
+         xlim = c(1, 0),  
+         ylim = c(0, 1),
+         auc.polygon = TRUE,auc.polygon.col = "#f7efe9"
+         ,print.auc = TRUE,print.auc.x = 0.5,print.auc.y = 0.2,print.auc.col = "black",print.auc.pattern = "AUC = %.2f (%.2f-%.2f)"
+         )
+
+dev.off()
+
+# Confusion Matrix for External Validation
+best.thr <- coords(rf_v2, "best", method = "youden")[1,1]
+
+pred.class <- ifelse(v2_predictions > best.thr,
+                     levels(task_validation2$group)[2],   
+                     levels(task_validation2$group)[1])   
+pred.class <- factor(pred.class, levels = levels(task_validation2$group))
+
+cm <- confusionMatrix(pred.class, task_validation2$group, mode = "everything",positive = "GC")
+cm
+
+
+plot_cm_gc_chg <- function(cm, family="sans", outfile = "cm_GC_ChG.pdf"){
+  cTab <- as.data.frame(as.table(cm$table))
+  cTab$Reference  <- factor(cTab$Reference,  levels = c("ChG","GC"), labels = c("ChG","GC"))
+  cTab$Prediction <- factor(cTab$Prediction, levels = c("ChG","GC"), labels = c("ChG","GC"))
+  p <- ggplot(cTab, aes(Prediction, Reference, fill = Freq)) +
+       geom_tile(color = "black", linewidth = 0.25) +
+       geom_text(aes(label = Freq), size = 8, color = "black") +
+       scale_fill_gradient(low = "white", high = "#7f5a2e") +
+       labs(x = "Predicted", y = "Observed") +
+       theme_minimal(base_size = 16, base_family = family) +
+       theme(panel.grid = element_blank(), legend.position = "none") +
+       labs(title = paste0("Sen. = ", round(cm$byClass["Sensitivity"],2), " Spe. = ", round(cm$byClass["Specificity"],2)," \nAccuracy = ",round(cm$overall["Accuracy"],2)," (",round(cm$overall["AccuracyLower"],2)," - ",round(cm$overall["AccuracyUpper"],2),")"))
+  ggsave(outfile, p, width = 5, height = 5, dpi = 300)
+  return(p)
+}
+
+
+p3<-plot_cm_gc_chg(cm, 
+               outfile=paste(path,"cm_RF_v2.pdf",sep = ""))
+
+# Combine Validation Images
+library(magick)
+img1_A <- image_read_pdf("./output/hrb2_rf.pdf", density = 300)   # 默认第 1 页
+img1_B <- image_read_pdf("./output/cm_RF_v2.pdf", density = 300)
+
+label <- function(img, txt) {
+  image_annotate(img, txt,
+                 gravity = "northwest",   # 左上
+                 location = "+30+30",
+                 size = 15,
+                 color = "black",
+                 boxcolor = "white",
+                 font = "sans")
+}
+img1_A <- label(img1_A, "A")
+img1_B <- label(img1_B, "B")
+
+combined_validation <- image_append(c(img1_A, img1_B))
+
+image_write(combined_validation, "./output/top_stool_validationHEB.pdf", format = "pdf")
+
+combined_validation
+
+```
+
+#Final Image Assembly
+```{r final_assembly}
+# =========================================================================
+# Stitch together Boruta, ROC, and Confusion Matrix into one final PDF
+# =========================================================================
+library(magick)
+img1_A <- image_read_pdf("./output/boruta_feature_selection_bar.pdf", density = 300)   # 默认第 1 页
+img1_B <- image_read_pdf("./output/hrb_rf.pdf", density = 300)
+img1_C <- image_read_pdf("./output/cm_RF.pdf", density = 300)
+
+img1_A <- image_resize(img1_A, "1200")
+img1_B <- image_resize(img1_B, "1200")
+img1_C <- image_resize(img1_C, "960")
+
+label <- function(img, txt) {
+  image_annotate(img, txt,
+                 gravity = "northwest",   # 左上
+                 location = "+30+30",
+                 size = 15,
+                 color = "black",
+                 boxcolor = "white",
+                 font = "sans")
+}
+img1_A <- label(img1_A, "A")
+img1_A
+img1_B <- label(img1_B, "B")
+img1_C <- label(img1_C, "C")
+
+combined <- image_append(c(img1_A, img1_B,img1_C))
+
+image_write(combined, "./output/top_stool.pdf", format = "pdf")
+
+combined 
+```
+
+
+

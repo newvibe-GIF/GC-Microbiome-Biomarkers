@@ -1,0 +1,6 @@
+"","method","datasets","pValue","ci1","ci2"
+"1","DeLong's test for two correlated ROC curves","rf_hrb and svm_hrb","0.287207586638167","-0.0230600758488144","0.0778600758488146"
+"2","DeLong's test for two correlated ROC curves","rf_hrb and lda_hrb","0.254775831216819","-0.0203333102161554","0.0767333102161556"
+"3","DeLong's test for two correlated ROC curves","rf_hrb and glm_hrb","0.383599901774421","-0.0267396417019521","0.0695396417019521"
+"4","DeLong's test for two correlated ROC curves","rf_hrb and nnet_hrb","0.0197294266266445","0.0133206890347047","0.153879310965295"
+"5","DeLong's test for two correlated ROC curves","rf_hrb and kknn_hrb","0.00172461564049284","0.0362618229663071","0.157338177033693"
