@@ -78,7 +78,7 @@ git clone [https://github.com/newvibe-GIF/GC-Microbiome-Biomarkers.git](https://
 
 ### 3. 最终组合成果图 (Final Assembly)
 
-![Final Assembly](stool_n28_confirmed_files/figure-gfm/final_assembly-1.png)
+![Final Assembly](stool_n28_confirmed_files/figure-gfm/final_assembly-2.png)
 
 ---
 
