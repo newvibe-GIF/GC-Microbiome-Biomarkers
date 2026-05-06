@@ -75,7 +75,7 @@
 请确保您的 R 环境安装了以下核心依赖包：
 
 ```R
-install.packages(c("Boruta", "caret", "randomForest", "pROC", "magick", "data.table", "dplyr", "ggplot2"))
+install.packages(c("Boruta", "caret", "randomForest", "pROC", "magick", "data.table", "dplyr", "ggplot2","pdftools"))
 ```
 
 ### 2. 运行分析 (Run)
