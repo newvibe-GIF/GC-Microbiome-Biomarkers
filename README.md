@@ -110,7 +110,7 @@ git clone [https://github.com/newvibe-GIF/GC-Microbiome-Biomarkers.git](https://
 ---
 
 ## ✒️ 引用 (Citation)
-该项目源于深圳华大基因股份有限公司刘莉萍老师的研究工作,如果您在研究中使用了本套分析代码或思路，请引用我们的研究工作：
+该项目源于深圳华大基因股份有限公司刘莉萍、覃友文老师的研究工作,如果您在研究中使用了本套分析代码或思路，请引用我们的研究工作：
 [ Distinct signatures in the human gut and oral microbiomes of gastric cancer] > Qin Y., Zhang Y., Liu L., et al. Cell Reports Medicine (2026).
 DOI: [https://doi.org/10.1016/j.xcrm.2026.102761]
 
